@@ -1,0 +1,25 @@
+div-19-emergency-response/
+│
+├── README.md
+├── LICENSE
+├── .gitignore
+│
+├── docs/
+│   ├── emergency-charter.md
+│   ├── circuit-breaker-specs.md
+│   └── override-protocols.md
+│
+├── src/
+│   ├── core/
+│   │   ├── CircuitBreaker.ts
+│   │   └── EmergencyOverride.ts
+│   │
+│   ├── api/
+│   │   └── emergency.ts
+│   │
+│   └── app/
+│       ├── layout.tsx
+│       └── page.tsx
+│
+└── public/
+    └── logo.png
