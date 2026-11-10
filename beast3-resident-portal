@@ -1,0 +1,132 @@
+"""
+beast3-division-sdk | Canonical Inter-Division Client & PII Redaction Layer
+Connects beast3-resident-portal to your existing BEAST 3.0 microservices.
+Install/Use: Copy into beast3-resident-portal or publish as an internal package.
+"""
+
+import hashlib
+import os
+import re
+from typing import Any, Dict, List, Optional
+import httpx
+from pydantic import BaseModel, Field
+
+
+# ---------------------------------------------------------------------------
+# 1. Service Registry (Points to your existing Cloud Run / Local Services)
+# ---------------------------------------------------------------------------
+class Beast3Endpoints(BaseModel):
+    policy_guard_url: str = Field(
+        default_factory=lambda: os.getenv("BEAST3_POLICY_GUARD_URL", "http://localhost:8001")
+    )
+    event_router_url: str = Field(
+        default_factory=lambda: os.getenv("BEAST3_EVENT_ROUTER_URL", "http://localhost:8002")
+    )
+    relayer_bridge_url: str = Field(
+        default_factory=lambda: os.getenv("BEAST3_RELAYER_BRIDGE_URL", "http://localhost:8003")
+    )
+    civic_aid_url: str = Field(
+        default_factory=lambda: os.getenv("BEAST3_CIVIC_AID_URL", "http://localhost:8004")
+    )
+    credit_repair_url: str = Field(
+        default_factory=lambda: os.getenv("BEAST3_CREDIT_REPAIR_URL", "http://localhost:8005")
+    )
+    home_loan_url: str = Field(
+        default_factory=lambda: os.getenv("BEAST3_HOME_LOAN_URL", "http://localhost:8006")
+    )
+
+
+# ---------------------------------------------------------------------------
+# 2. Automatic PII Redaction Guard (Protects Agent Swarm & Event Logs)
+# ---------------------------------------------------------------------------
+SSN_PATTERN = re.compile(r"\b\d{3}-\d{2}-\d{4}\b|\b\d{9}\b")
+
+
+def redact_sensitive_fields(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Strips raw SSNs and vault-only fields before emitting CloudEvents."""
+    blocked_keys = {"ssn", "social_security_number", "bank_account", "routing_number"}
+    sanitized: Dict[str, Any] = {}
+    for k, v in payload.items():
+        if k.lower() in blocked_keys:
+            sanitized[k] = "[REDACTED_VAULT_ONLY]"
+        elif isinstance(v, str):
+            sanitized[k] = SSN_PATTERN.sub("[REDACTED_SSN]", v)
+        elif isinstance(v, dict):
+            sanitized[k] = redact_sensitive_fields(v)
+        else:
+            sanitized[k] = v
+    return sanitized
+
+
+# ---------------------------------------------------------------------------
+# 3. Unified BEAST 3.0 Async Mesh Client
+# ---------------------------------------------------------------------------
+class Beast3MeshClient:
+    def __init__(self, endpoints: Optional[Beast3Endpoints] = None, timeout: float = 4.0):
+        self.endpoints = endpoints or Beast3Endpoints()
+        self.timeout = timeout
+
+    async def verify_constitutional_policy(
+        self,
+        division_id: str,
+        action_type: str,
+        amount_usd: float,
+        resident_hash: str,
+        eip712_sig: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Calls your existing beast3-constitutional-policy-guard service."""
+        body = {
+            "division_id": division_id,
+            "action_type": action_type,
+            "requested_amount_usd": amount_usd,
+            "recipient_identifier": resident_hash,
+            "eip712_signature_present": bool(eip712_sig),
+        }
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.post(f"{self.endpoints.policy_guard_url}/api/validate-action", json=body)
+            resp.raise_for_status()
+            return resp.json()
+
+    async def dispatch_division_event(
+        self,
+        source_division: str,
+        target_division: str,
+        event_type: str,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Emits an idempotent, PII-scrubbed event to beast3-division-event-router."""
+        clean_payload = redact_sensitive_fields(payload)
+        idempotency_key = hashlib.sha256(
+            f"{source_division}:{target_division}:{event_type}:{sorted(clean_payload.items())}".encode()
+        ).hexdigest()
+
+        envelope = {
+            "idempotency_key": idempotency_key,
+            "source": source_division,
+            "target": target_division,
+            "type": event_type,
+            "data": clean_payload,
+        }
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.post(f"{self.endpoints.event_router_url}/events", json=envelope)
+            resp.raise_for_status()
+            return resp.json()
+
+    async def relay_gasless_intent(
+        self,
+        signer_address: str,
+        typed_data_hash: str,
+        signature: str,
+        merkle_receipt: str,
+    ) -> Dict[str, Any]:
+        """Submits a policy-approved EIP-712 permit to beast3-gasless-relayer-bridge."""
+        body = {
+            "signer": signer_address,
+            "typed_data_hash": typed_data_hash,
+            "signature": signature,
+            "policy_merkle_receipt": merkle_receipt,
+        }
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            resp = await client.post(f"{self.endpoints.relayer_bridge_url}/relay", json=body)
+            resp.raise_for_status()
+            return resp.json()
